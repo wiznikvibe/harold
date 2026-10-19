@@ -436,6 +436,47 @@ def delete_vectors_by_ids(index, ids: list[str], batch_size: int = 100) -> None:
             index.delete(ids=batch)
 
 
+def failure_state_values(
+    prior: dict | None,
+    *,
+    new_content_hash: str = "",
+) -> tuple[str, int, int, str]:
+    """Fields to preserve on failure when no successful write occurred."""
+    if prior:
+        return (
+            prior["content_hash"],
+            prior["version"],
+            prior["chunk_count"],
+            prior["embedding_model"],
+        )
+    return (new_content_hash, 0, 0, EMBEDDING_MODEL)
+
+
+def upsert_outer_failure_state(
+    conn,
+    document_id: str,
+    *,
+    source_type: str,
+    last_error: str,
+    new_content_hash: str = "",
+) -> None:
+    prior = fetch_document_state(conn, document_id)
+    content_hash, version, chunk_count, embedding_model = failure_state_values(
+        prior, new_content_hash=new_content_hash
+    )
+    upsert_document_state(
+        conn,
+        document_id=document_id,
+        content_hash=content_hash,
+        version=version,
+        chunk_count=chunk_count,
+        status="failed",
+        embedding_model=embedding_model,
+        source_type=source_type,
+        last_error=last_error[:1000],
+    )
+
+
 def process_document(
     *,
     conn,
@@ -479,14 +520,15 @@ def process_document(
         return "success"
     except Exception as exc:
         logger.exception("failed processing %s", document_id)
+        ch, ver, cc, em = failure_state_values(state, new_content_hash=content_hash)
         upsert_document_state(
             conn,
             document_id=document_id,
-            content_hash=state["content_hash"] if state else content_hash,
-            version=state["version"] if state else 0,
-            chunk_count=state["chunk_count"] if state else 0,
+            content_hash=ch,
+            version=ver,
+            chunk_count=cc,
             status="failed",
-            embedding_model=state["embedding_model"] if state else EMBEDDING_MODEL,
+            embedding_model=em,
             source_type=source_type,
             last_error=str(exc)[:1000],
         )
@@ -521,37 +563,50 @@ def run_ingestion(files_only=False, rows_only=False, limit_rows=None, policy_dir
     index = ensure_pinecone_index(pc, cfg["index_name"], dim)
 
     if not rows_only:
-        files = discover_policy_files(policy_dir)
-        current_file_ids = {p.name for p in files}
-        reconcile_deletions(conn, index, current_file_ids, "file")
-        for path in files:
-            try:
-                raw = path.read_bytes()
-                content_hash = sha256_bytes(raw)
-                chunks = chunk_documents(parse_file(path))
-                status = process_document(
-                    conn=conn,
-                    index=index,
-                    embeddings=embeddings,
-                    document_id=path.name,
-                    content_hash=content_hash,
-                    source_type="file",
-                    chunks=chunks,
+        policy_path = Path(policy_dir)
+        if not policy_path.is_dir():
+            logger.error(
+                "policy_dir missing or not a directory: %s; skipping file ingestion",
+                policy_dir,
+            )
+        else:
+            files = discover_policy_files(policy_dir)
+            current_file_ids = {p.name for p in files}
+            tracked_file_ids = set(list_document_ids(conn, source_type="file"))
+            if not files and tracked_file_ids:
+                logger.error(
+                    "policy_dir %s yielded no files but %d tracked file documents exist; "
+                    "skipping file reconcile and processing",
+                    policy_dir,
+                    len(tracked_file_ids),
                 )
-                logger.info("file %s -> %s", path.name, status)
-            except Exception as exc:
-                logger.exception("outer failure file %s: %s", path.name, exc)
-                upsert_document_state(
-                    conn,
-                    document_id=path.name,
-                    content_hash="",
-                    version=0,
-                    chunk_count=0,
-                    status="failed",
-                    embedding_model=EMBEDDING_MODEL,
-                    source_type="file",
-                    last_error=str(exc)[:1000],
-                )
+            else:
+                reconcile_deletions(conn, index, current_file_ids, "file")
+                for path in files:
+                    content_hash = ""
+                    try:
+                        raw = path.read_bytes()
+                        content_hash = sha256_bytes(raw)
+                        chunks = chunk_documents(parse_file(path))
+                        status = process_document(
+                            conn=conn,
+                            index=index,
+                            embeddings=embeddings,
+                            document_id=path.name,
+                            content_hash=content_hash,
+                            source_type="file",
+                            chunks=chunks,
+                        )
+                        logger.info("file %s -> %s", path.name, status)
+                    except Exception as exc:
+                        logger.exception("outer failure file %s: %s", path.name, exc)
+                        upsert_outer_failure_state(
+                            conn,
+                            path.name,
+                            source_type="file",
+                            last_error=str(exc),
+                            new_content_hash=content_hash,
+                        )
 
     if not files_only:
         rows = fetch_table_rows(conn, limit=limit_rows)
@@ -560,6 +615,7 @@ def run_ingestion(files_only=False, rows_only=False, limit_rows=None, policy_dir
             reconcile_deletions(conn, index, current_row_ids, "table_row")
         for row in rows:
             doc_id = row_document_id(TABLE_NAME, row["id"])
+            content_hash = ""
             try:
                 payload = canonical_row_payload(row)
                 content_hash = sha256_text(payload)
@@ -576,16 +632,12 @@ def run_ingestion(files_only=False, rows_only=False, limit_rows=None, policy_dir
                 logger.info("row %s -> %s", doc_id, status)
             except Exception as exc:
                 logger.exception("outer failure row %s: %s", doc_id, exc)
-                upsert_document_state(
+                upsert_outer_failure_state(
                     conn,
-                    document_id=doc_id,
-                    content_hash="",
-                    version=0,
-                    chunk_count=0,
-                    status="failed",
-                    embedding_model=EMBEDDING_MODEL,
+                    doc_id,
                     source_type="table_row",
-                    last_error=str(exc)[:1000],
+                    last_error=str(exc),
+                    new_content_hash=content_hash,
                 )
 
     conn.close()

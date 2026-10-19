@@ -74,3 +74,22 @@ def test_upsert_chunks_builds_hierarchical_ids():
     assert n == 2
     assert idx.upserts[0]["id"] == "SOP.md-v3-c0"
     assert idx.upserts[1]["id"] == "SOP.md-v3-c1"
+
+
+def test_failure_state_values_preserves_prior():
+    prior = {
+        "content_hash": "deadbeef",
+        "version": 3,
+        "chunk_count": 12,
+        "embedding_model": "custom/model",
+    }
+    ch, ver, cc, em = ing.failure_state_values(prior)
+    assert (ch, ver, cc, em) == ("deadbeef", 3, 12, "custom/model")
+
+
+def test_failure_state_values_new_document():
+    ch, ver, cc, em = ing.failure_state_values(None, new_content_hash="abc")
+    assert ch == "abc"
+    assert ver == 0
+    assert cc == 0
+    assert em == ing.EMBEDDING_MODEL
