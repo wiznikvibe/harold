@@ -417,3 +417,33 @@ def test_run_ingestion_limit_rows_skips_table_reconcile():
         code = ing.run_ingestion(rows_only=True, limit_rows=5)
         reconcile.assert_not_called()
         assert code == 0
+
+
+def test_run_ingestion_full_rows_reconciles_table_deletions():
+    fake_index = FakeIndex()
+    fake_conn = FakeConn()
+    with patch.object(ing, "load_config") as load_cfg, patch.object(
+        ing, "get_mysql_connection", return_value=fake_conn
+    ), patch.object(ing, "init_state_schema"), patch.object(
+        ing, "build_embeddings"
+    ), patch.object(
+        ing, "embedding_dimension", return_value=8
+    ), patch.object(
+        ing, "Pinecone"
+    ), patch.object(
+        ing, "ensure_pinecone_index", return_value=fake_index
+    ), patch.object(
+        ing, "fetch_table_rows", return_value=[]
+    ) as fetch_rows, patch.object(
+        ing, "reconcile_deletions"
+    ) as reconcile:
+        load_cfg.return_value = {
+            "policy_dir": "/tmp/unused",
+            "embedding_model": ing.EMBEDDING_MODEL,
+            "pinecone_api_key": "k",
+            "index_name": "idx",
+        }
+        code = ing.run_ingestion(rows_only=True, limit_rows=None)
+        fetch_rows.assert_called_once_with(fake_conn, limit=None)
+        reconcile.assert_called_once_with(fake_conn, fake_index, set(), "table_row")
+        assert code == 0
