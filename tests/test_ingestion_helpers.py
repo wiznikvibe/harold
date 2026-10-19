@@ -33,3 +33,10 @@ def test_canonical_row_payload_stable():
 def test_sha256_bytes_deterministic():
     assert ing.sha256_bytes(b"abc") == ing.sha256_bytes(b"abc")
     assert ing.sha256_bytes(b"abc") != ing.sha256_bytes(b"abd")
+
+
+def test_init_state_schema_sql_contains_table_name():
+    statements = ing.state_schema_statements()
+    assert any(ing.STATE_TABLE in s for s in statements)
+    assert any("content_hash" in s for s in statements)
+    assert any("chunk_count" in s for s in statements)
