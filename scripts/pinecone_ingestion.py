@@ -535,6 +535,19 @@ def process_document(
         return "failed"
 
 
+def should_process_files(
+    policy_dir: str | Path,
+    discovered_ids: set[str],
+    tracked_file_ids: set[str],
+) -> tuple[bool, str]:
+    """Whether file ingestion may reconcile and process. False => do not call reconcile_deletions."""
+    if not Path(policy_dir).is_dir():
+        return False, "policy_dir_not_directory"
+    if not discovered_ids and tracked_file_ids:
+        return False, "empty_discovery_with_tracked"
+    return True, ""
+
+
 def reconcile_deletions(conn, index, current_ids: set[str], source_type: str) -> int:
     deleted = 0
     for doc_id in list_document_ids(conn, source_type=source_type):
@@ -563,50 +576,53 @@ def run_ingestion(files_only=False, rows_only=False, limit_rows=None, policy_dir
     index = ensure_pinecone_index(pc, cfg["index_name"], dim)
 
     if not rows_only:
+        tracked_file_ids = set(list_document_ids(conn, source_type="file"))
         policy_path = Path(policy_dir)
-        if not policy_path.is_dir():
-            logger.error(
-                "policy_dir missing or not a directory: %s; skipping file ingestion",
-                policy_dir,
-            )
-        else:
-            files = discover_policy_files(policy_dir)
-            current_file_ids = {p.name for p in files}
-            tracked_file_ids = set(list_document_ids(conn, source_type="file"))
-            if not files and tracked_file_ids:
+        files = discover_policy_files(policy_dir) if policy_path.is_dir() else []
+        discovered_ids = {p.name for p in files}
+        should_process, skip_reason = should_process_files(
+            policy_dir, discovered_ids, tracked_file_ids
+        )
+        if not should_process:
+            if skip_reason == "policy_dir_not_directory":
+                logger.error(
+                    "policy_dir missing or not a directory: %s; skipping file ingestion",
+                    policy_dir,
+                )
+            elif skip_reason == "empty_discovery_with_tracked":
                 logger.error(
                     "policy_dir %s yielded no files but %d tracked file documents exist; "
                     "skipping file reconcile and processing",
                     policy_dir,
                     len(tracked_file_ids),
                 )
-            else:
-                reconcile_deletions(conn, index, current_file_ids, "file")
-                for path in files:
-                    content_hash = ""
-                    try:
-                        raw = path.read_bytes()
-                        content_hash = sha256_bytes(raw)
-                        chunks = chunk_documents(parse_file(path))
-                        status = process_document(
-                            conn=conn,
-                            index=index,
-                            embeddings=embeddings,
-                            document_id=path.name,
-                            content_hash=content_hash,
-                            source_type="file",
-                            chunks=chunks,
-                        )
-                        logger.info("file %s -> %s", path.name, status)
-                    except Exception as exc:
-                        logger.exception("outer failure file %s: %s", path.name, exc)
-                        upsert_outer_failure_state(
-                            conn,
-                            path.name,
-                            source_type="file",
-                            last_error=str(exc),
-                            new_content_hash=content_hash,
-                        )
+        else:
+            reconcile_deletions(conn, index, discovered_ids, "file")
+            for path in files:
+                content_hash = ""
+                try:
+                    raw = path.read_bytes()
+                    content_hash = sha256_bytes(raw)
+                    chunks = chunk_documents(parse_file(path))
+                    status = process_document(
+                        conn=conn,
+                        index=index,
+                        embeddings=embeddings,
+                        document_id=path.name,
+                        content_hash=content_hash,
+                        source_type="file",
+                        chunks=chunks,
+                    )
+                    logger.info("file %s -> %s", path.name, status)
+                except Exception as exc:
+                    logger.exception("outer failure file %s: %s", path.name, exc)
+                    upsert_outer_failure_state(
+                        conn,
+                        path.name,
+                        source_type="file",
+                        last_error=str(exc),
+                        new_content_hash=content_hash,
+                    )
 
     if not files_only:
         rows = fetch_table_rows(conn, limit=limit_rows)

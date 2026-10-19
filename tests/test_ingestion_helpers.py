@@ -1,6 +1,8 @@
 import json
 import sys
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -93,3 +95,162 @@ def test_failure_state_values_new_document():
     assert ver == 0
     assert cc == 0
     assert em == ing.EMBEDDING_MODEL
+
+
+def test_failure_state_values_prior_ignores_new_content_hash():
+    prior = {
+        "content_hash": "keep-me",
+        "version": 2,
+        "chunk_count": 5,
+        "embedding_model": "m",
+    }
+    ch, ver, cc, em = ing.failure_state_values(prior, new_content_hash="would-wipe")
+    assert (ch, ver, cc, em) == ("keep-me", 2, 5, "m")
+
+
+class FakeCursor:
+    def __init__(self, conn):
+        self._conn = conn
+        self.last_execute = None
+
+    def execute(self, sql, params=None):
+        self.last_execute = (sql, params)
+        self._conn.last_sql = sql
+        self._conn.last_params = params
+
+    def fetchone(self):
+        if self._conn.fetchone_result is not None:
+            return self._conn.fetchone_result
+        return None
+
+    def fetchall(self):
+        return []
+
+
+class FakeConn:
+    def __init__(self, *, fetchone_result=None):
+        self.fetchone_result = fetchone_result
+        self.last_sql = None
+        self.last_params = None
+
+    def close(self):
+        pass
+
+    @contextmanager
+    def cursor(self):
+        yield FakeCursor(self)
+
+
+def test_upsert_outer_failure_state_preserves_prior_version():
+    prior = {
+        "content_hash": "deadbeef",
+        "version": 7,
+        "chunk_count": 99,
+        "embedding_model": "custom/model",
+    }
+    conn = FakeConn(fetchone_result=prior)
+    ing.upsert_outer_failure_state(
+        conn,
+        "SOP.md",
+        source_type="file",
+        last_error="parse blew up",
+        new_content_hash="new-hash-should-not-win",
+    )
+    assert conn.last_params is not None
+    (
+        document_id,
+        content_hash,
+        version,
+        chunk_count,
+        status,
+        embedding_model,
+        source_type,
+        last_error,
+    ) = conn.last_params
+    assert document_id == "SOP.md"
+    assert content_hash == "deadbeef"
+    assert version == 7
+    assert chunk_count == 99
+    assert status == "failed"
+    assert embedding_model == "custom/model"
+    assert source_type == "file"
+    assert last_error == "parse blew up"
+
+
+def test_upsert_outer_failure_state_new_document_uses_new_hash():
+    conn = FakeConn(fetchone_result=None)
+    ing.upsert_outer_failure_state(
+        conn,
+        "new.md",
+        source_type="file",
+        last_error="read failed",
+        new_content_hash="fresh",
+    )
+    _, content_hash, version, chunk_count, status, embedding_model, _, _ = conn.last_params
+    assert content_hash == "fresh"
+    assert version == 0
+    assert chunk_count == 0
+    assert status == "failed"
+    assert embedding_model == ing.EMBEDDING_MODEL
+
+
+def test_should_process_files_missing_policy_dir(tmp_path):
+    missing = tmp_path / "nope"
+    ok, reason = ing.should_process_files(missing, {"a.md"}, set())
+    assert ok is False
+    assert reason == "policy_dir_not_directory"
+
+
+def test_should_process_files_empty_discovery_with_tracked(tmp_path):
+    policy = tmp_path / "policies"
+    policy.mkdir()
+    ok, reason = ing.should_process_files(policy, set(), {"SOP.md"})
+    assert ok is False
+    assert reason == "empty_discovery_with_tracked"
+
+
+def test_should_process_files_empty_discovery_no_tracked_ok(tmp_path):
+    policy = tmp_path / "policies"
+    policy.mkdir()
+    ok, reason = ing.should_process_files(policy, set(), set())
+    assert ok is True
+    assert reason == ""
+
+
+def test_should_process_files_happy_path(tmp_path):
+    policy = tmp_path / "policies"
+    policy.mkdir()
+    ok, reason = ing.should_process_files(policy, {"SOP.md"}, {"old.md"})
+    assert ok is True
+    assert reason == ""
+
+
+def test_run_ingestion_skips_reconcile_when_policy_dir_missing(tmp_path):
+    with patch.object(ing, "load_config") as load_cfg, patch.object(
+        ing, "get_mysql_connection"
+    ) as get_conn, patch.object(ing, "init_state_schema"), patch.object(
+        ing, "build_embeddings"
+    ), patch.object(
+        ing, "embedding_dimension", return_value=8
+    ), patch.object(
+        ing, "Pinecone"
+    ), patch.object(
+        ing, "ensure_pinecone_index"
+    ), patch.object(
+        ing, "list_document_ids", return_value=["SOP.md"]
+    ), patch.object(
+        ing, "reconcile_deletions"
+    ) as reconcile, patch.object(
+        ing, "discover_policy_files"
+    ) as discover:
+        load_cfg.return_value = {
+            "policy_dir": str(tmp_path / "missing"),
+            "embedding_model": ing.EMBEDDING_MODEL,
+            "pinecone_api_key": "k",
+            "index_name": "idx",
+        }
+        fake_conn = FakeConn()
+        get_conn.return_value = fake_conn
+        ing.run_ingestion(files_only=True, policy_dir=str(tmp_path / "missing"))
+        reconcile.assert_not_called()
+        discover.assert_not_called()
