@@ -47,3 +47,30 @@ def test_init_state_schema_sql_contains_table_name():
     assert any(ing.STATE_TABLE in s for s in statements)
     assert any("content_hash" in s for s in statements)
     assert any("chunk_count" in s for s in statements)
+
+
+class FakeIndex:
+    def __init__(self):
+        self.upserts = []
+        self.deletes = []
+
+    def upsert(self, vectors):
+        self.upserts.extend(vectors)
+        return {"upserted_count": len(vectors)}
+
+    def delete(self, ids):
+        self.deletes.extend(ids)
+
+
+class FakeEmb:
+    def embed_documents(self, texts):
+        return [[0.1] * 8 for _ in texts]
+
+
+def test_upsert_chunks_builds_hierarchical_ids():
+    idx = FakeIndex()
+    chunks = [ing.Document("a", {}), ing.Document("b", {})]
+    n = ing.upsert_chunks(idx, FakeEmb(), "SOP.md", 3, chunks, batch_size=10)
+    assert n == 2
+    assert idx.upserts[0]["id"] == "SOP.md-v3-c0"
+    assert idx.upserts[1]["id"] == "SOP.md-v3-c1"

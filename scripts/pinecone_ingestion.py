@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +16,8 @@ import pymysql
 from dotenv import load_dotenv
 from pinecone import Pinecone, ServerlessSpec
 
+
+logger = logging.getLogger("pinecone_ingestion")
 
 EMBEDDING_MODEL = "google/embeddinggemma-300m"
 DEFAULT_INDEX_NAME = "harold-logistics"
@@ -365,3 +369,67 @@ def ensure_pinecone_index(
                 f"!= embedding dimension {dimension}. Refusing to delete/recreate."
             )
     return pc.Index(index_name)
+
+
+def upsert_chunks(
+    index,
+    embeddings,
+    document_id,
+    version,
+    chunks,
+    batch_size=50,
+    max_retries=3,
+) -> int:
+    texts = [c.page_content for c in chunks]
+    embedded: list[list[float]] = []
+    for i in range(0, len(texts), batch_size):
+        embedded.extend(embeddings.embed_documents(texts[i : i + batch_size]))
+    ingested_at = datetime.now(timezone.utc).isoformat()
+    vectors_payload = []
+    for i, (chunk, values) in enumerate(zip(chunks, embedded)):
+        meta = {
+            "document_id": document_id,
+            "source_file": chunk.metadata.get("source_file", document_id),
+            "version": version,
+            "chunk_index": i,
+            "embedding_model": EMBEDDING_MODEL,
+            "file_format": chunk.metadata.get("file_format", ""),
+            "document_type": chunk.metadata.get("document_type", ""),
+            "ingested_at": ingested_at,
+        }
+        for k in ("page_number", "row_index", "row_id"):
+            if k in chunk.metadata and chunk.metadata[k] is not None:
+                meta[k] = chunk.metadata[k]
+        clean = {
+            k: (v if isinstance(v, (str, int, float, bool)) else str(v))
+            for k, v in meta.items()
+        }
+        vectors_payload.append(
+            {
+                "id": vector_id(document_id, version, i),
+                "values": values,
+                "metadata": clean,
+            }
+        )
+
+    upserted = 0
+    for i in range(0, len(vectors_payload), batch_size):
+        batch = vectors_payload[i : i + batch_size]
+        for attempt in range(1, max_retries + 1):
+            try:
+                index.upsert(vectors=batch)
+                upserted += len(batch)
+                break
+            except Exception as exc:
+                if attempt == max_retries:
+                    raise
+                logger.warning("upsert retry %s/%s: %s", attempt, max_retries, exc)
+                time.sleep(2**attempt)
+    return upserted
+
+
+def delete_vectors_by_ids(index, ids: list[str], batch_size: int = 100) -> None:
+    for i in range(0, len(ids), batch_size):
+        batch = ids[i : i + batch_size]
+        if batch:
+            index.delete(ids=batch)
