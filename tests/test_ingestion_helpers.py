@@ -35,6 +35,13 @@ def test_sha256_bytes_deterministic():
     assert ing.sha256_bytes(b"abc") != ing.sha256_bytes(b"abd")
 
 
+def test_row_to_text_skips_nulls():
+    text = ing.row_to_text({"id": 1, "RISK_CLS_TXT": "HIGH", "x": None})
+    assert "id: 1" in text
+    assert "RISK_CLS_TXT: HIGH" in text
+    assert "x:" not in text
+
+
 def test_init_state_schema_sql_contains_table_name():
     statements = ing.state_schema_statements()
     assert any(ing.STATE_TABLE in s for s in statements)

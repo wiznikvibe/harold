@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import pymysql
@@ -18,6 +20,13 @@ DEFAULT_INDEX_NAME = "harold-logistics"
 POLICY_DIR_DEFAULT = "datasource/policy"
 TABLE_NAME = "dynamic_supply_chain_logistics"
 STATE_TABLE = "ingestion_document_state"
+SUPPORTED_SUFFIXES = {".md", ".txt", ".pdf", ".csv", ".xlsx"}
+
+
+@dataclass
+class Document:
+    page_content: str
+    metadata: dict = field(default_factory=dict)
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -54,6 +63,130 @@ def row_to_text(row: dict[str, Any]) -> str:
             continue
         lines.append(f"{key}: {val}")
     return "\n".join(lines)
+
+
+def discover_policy_files(policy_dir: str) -> list[Path]:
+    root = Path(policy_dir)
+    files = []
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES:
+            files.append(path)
+    return files
+
+
+def parse_file(path: Path) -> list[Document]:
+    suffix = path.suffix.lower()
+    source = path.name
+    if suffix in {".md", ".txt"}:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        return [
+            Document(
+                text,
+                {
+                    "source_file": source,
+                    "file_format": suffix.lstrip("."),
+                    "document_type": "policy",
+                    "page_number": 1,
+                },
+            )
+        ]
+    if suffix == ".pdf":
+        from pypdf import PdfReader
+
+        reader = PdfReader(str(path))
+        docs = []
+        for i, page in enumerate(reader.pages, start=1):
+            docs.append(
+                Document(
+                    page.extract_text() or "",
+                    {
+                        "source_file": source,
+                        "file_format": "pdf",
+                        "document_type": "policy",
+                        "page_number": i,
+                    },
+                )
+            )
+        return docs
+    if suffix == ".csv":
+        import pandas as pd
+
+        df = pd.read_csv(path)
+        docs = []
+        for idx, row in df.iterrows():
+            payload = row.dropna().to_dict()
+            docs.append(
+                Document(
+                    row_to_text(payload),
+                    {
+                        "source_file": source,
+                        "file_format": "csv",
+                        "document_type": "tabular_file",
+                        "row_index": int(idx),
+                    },
+                )
+            )
+        return docs
+    if suffix == ".xlsx":
+        import pandas as pd
+
+        df = pd.read_excel(path)
+        docs = []
+        for idx, row in df.iterrows():
+            payload = row.dropna().to_dict()
+            docs.append(
+                Document(
+                    row_to_text(payload),
+                    {
+                        "source_file": source,
+                        "file_format": "xlsx",
+                        "document_type": "tabular_file",
+                        "row_index": int(idx),
+                    },
+                )
+            )
+        return docs
+    raise ValueError(f"Unsupported file type: {path}")
+
+
+def chunk_documents(
+    docs: list[Document], chunk_size: int = 800, chunk_overlap: int = 120
+) -> list[Document]:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size, chunk_overlap=chunk_overlap
+    )
+    out: list[Document] = []
+    for doc in docs:
+        if not doc.page_content.strip():
+            continue
+        for chunk in splitter.split_text(doc.page_content):
+            out.append(Document(chunk, dict(doc.metadata)))
+    return out
+
+
+def fetch_table_rows(conn, limit: int | None = None) -> list[dict]:
+    sql = f"SELECT * FROM {TABLE_NAME}"
+    if limit is not None:
+        sql += f" LIMIT {int(limit)}"
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        return list(cur.fetchall())
+
+
+def row_as_document(row: dict) -> Document:
+    row_id = row["id"]
+    return Document(
+        row_to_text(row),
+        {
+            "source_file": TABLE_NAME,
+            "file_format": "mysql_row",
+            "document_type": "telemetry",
+            "row_id": row_id,
+            "row_index": row_id,
+        },
+    )
 
 
 def load_config() -> dict[str, str]:
