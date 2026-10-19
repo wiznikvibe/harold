@@ -1,0 +1,10 @@
+python-dotenv>=1.0.0
+pymysql>=1.1.0
+pinecone>=5.0.0
+langchain-huggingface>=0.1.0
+langchain-text-splitters>=0.3.0
+sentence-transformers>=3.0.0
+pypdf>=4.0.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+pytest>=8.0.0
