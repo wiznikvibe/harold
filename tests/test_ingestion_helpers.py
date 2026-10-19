@@ -152,12 +152,13 @@ class FakeCursor:
         return None
 
     def fetchall(self):
-        return []
+        return list(self._conn.fetchall_result)
 
 
 class FakeConn:
-    def __init__(self, *, fetchone_result=None):
+    def __init__(self, *, fetchone_result=None, fetchall_result=None):
         self.fetchone_result = fetchone_result
+        self.fetchall_result = fetchall_result or []
         self.last_sql = None
         self.last_params = None
 
@@ -403,7 +404,7 @@ def test_run_ingestion_limit_rows_skips_table_reconcile():
     ), patch.object(
         ing, "fetch_table_rows", return_value=[{"id": 1}]
     ), patch.object(
-        ing, "process_document", return_value="skipped"
+        ing, "process_changed_rows", return_value=(1, 0, 0)
     ), patch.object(
         ing, "reconcile_deletions"
     ) as reconcile:
@@ -436,7 +437,9 @@ def test_run_ingestion_full_rows_reconciles_table_deletions():
         ing, "fetch_table_rows", return_value=[]
     ) as fetch_rows, patch.object(
         ing, "reconcile_deletions"
-    ) as reconcile:
+    ) as reconcile, patch.object(
+        ing, "process_changed_rows", return_value=(0, 0, 0)
+    ):
         load_cfg.return_value = {
             "policy_dir": "/tmp/unused",
             "embedding_model": ing.EMBEDDING_MODEL,
@@ -447,3 +450,72 @@ def test_run_ingestion_full_rows_reconciles_table_deletions():
         fetch_rows.assert_called_once_with(fake_conn, limit=None)
         reconcile.assert_called_once_with(fake_conn, fake_index, set(), "table_row")
         assert code == 0
+
+
+def test_process_row_batch_embeds_and_upserts_together():
+    idx = OrderTrackingIndex()
+    conn = FakeConn()
+    items = [
+        ing.RowWorkItem(
+            document_id="dynamic_supply_chain_logistics-1",
+            content_hash="h1",
+            chunks=[ing.Document("row one", {"source_file": ing.TABLE_NAME, "row_id": 1})],
+            state=None,
+            old_version=None,
+            old_chunk_count=0,
+            new_version=1,
+        ),
+        ing.RowWorkItem(
+            document_id="dynamic_supply_chain_logistics-2",
+            content_hash="h2",
+            chunks=[ing.Document("row two", {"source_file": ing.TABLE_NAME, "row_id": 2})],
+            state=_prior_state(version=3, chunk_count=1),
+            old_version=3,
+            old_chunk_count=1,
+            new_version=4,
+        ),
+    ]
+    statuses = ing.process_row_batch(
+        conn=conn,
+        index=idx,
+        embeddings=FakeEmb(),
+        items=items,
+        batch_size=50,
+    )
+    assert statuses == ["success", "success"]
+    upsert_ops = [op for op in idx.ops if op[0] == "upsert"]
+    assert len(upsert_ops) == 1
+    assert upsert_ops[0][1] == [
+        "dynamic_supply_chain_logistics-1-v1-c0",
+        "dynamic_supply_chain_logistics-2-v4-c0",
+    ]
+    # Old version for row 2 deleted after the batch upsert
+    assert ("delete", ["dynamic_supply_chain_logistics-2-v3-c0"]) in idx.ops
+    assert idx.ops[0][0] == "upsert"
+
+
+def test_process_row_batch_failure_scrubs_new_ids_keeps_old():
+    idx = FailOnNthUpsertIndex(fail_on_call=1)
+    conn = FakeConn()
+    items = [
+        ing.RowWorkItem(
+            document_id="dynamic_supply_chain_logistics-9",
+            content_hash="h9",
+            chunks=[ing.Document("row", {"row_id": 9})],
+            state=_prior_state(version=2, chunk_count=1),
+            old_version=2,
+            old_chunk_count=1,
+            new_version=3,
+        )
+    ]
+    statuses = ing.process_row_batch(
+        conn=conn,
+        index=idx,
+        embeddings=FakeEmb(),
+        items=items,
+        batch_size=50,
+        max_retries=1,
+    )
+    assert statuses == ["failed"]
+    # Prior version must not be deleted when the new batch upsert fails.
+    assert "dynamic_supply_chain_logistics-9-v2-c0" not in idx.deletes

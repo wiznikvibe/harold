@@ -27,12 +27,24 @@ POLICY_DIR_DEFAULT = "datasource/policy"
 TABLE_NAME = "dynamic_supply_chain_logistics"
 STATE_TABLE = "ingestion_document_state"
 SUPPORTED_SUFFIXES = {".md", ".txt", ".pdf", ".csv", ".xlsx"}
+DEFAULT_ROW_BATCH_SIZE = 50
 
 
 @dataclass
 class Document:
     page_content: str
     metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class RowWorkItem:
+    document_id: str
+    content_hash: str
+    chunks: list[Document]
+    state: dict | None
+    old_version: int | None
+    old_chunk_count: int
+    new_version: int
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -265,6 +277,26 @@ def fetch_document_state(conn, document_id: str) -> dict | None:
         return cur.fetchone()
 
 
+def fetch_document_states(conn, document_ids: list[str]) -> dict[str, dict]:
+    """Bulk-fetch state rows keyed by document_id."""
+    if not document_ids:
+        return {}
+    out: dict[str, dict] = {}
+    # Stay under typical max_allowed_packet / placeholder limits.
+    chunk = 500
+    with conn.cursor() as cur:
+        for i in range(0, len(document_ids), chunk):
+            batch = document_ids[i : i + chunk]
+            placeholders = ",".join(["%s"] * len(batch))
+            cur.execute(
+                f"SELECT * FROM {STATE_TABLE} WHERE document_id IN ({placeholders})",
+                batch,
+            )
+            for row in cur.fetchall():
+                out[row["document_id"]] = row
+    return out
+
+
 def upsert_document_state(
     conn,
     *,
@@ -373,47 +405,40 @@ def ensure_pinecone_index(
     return pc.Index(index_name)
 
 
-def upsert_chunks(
-    index,
-    embeddings,
-    document_id,
-    version,
-    chunks,
-    batch_size=50,
-    max_retries=3,
-) -> int:
-    texts = [c.page_content for c in chunks]
-    embedded: list[list[float]] = []
-    for i in range(0, len(texts), batch_size):
-        embedded.extend(embeddings.embed_documents(texts[i : i + batch_size]))
-    ingested_at = datetime.now(timezone.utc).isoformat()
-    vectors_payload = []
-    for i, (chunk, values) in enumerate(zip(chunks, embedded)):
-        meta = {
-            "document_id": document_id,
-            "source_file": chunk.metadata.get("source_file", document_id),
-            "version": version,
-            "chunk_index": i,
-            "embedding_model": EMBEDDING_MODEL,
-            "file_format": chunk.metadata.get("file_format", ""),
-            "document_type": chunk.metadata.get("document_type", ""),
-            "ingested_at": ingested_at,
-        }
-        for k in ("page_number", "row_index", "row_id"):
-            if k in chunk.metadata and chunk.metadata[k] is not None:
-                meta[k] = chunk.metadata[k]
-        clean = {
-            k: (v if isinstance(v, (str, int, float, bool)) else str(v))
-            for k, v in meta.items()
-        }
-        vectors_payload.append(
-            {
-                "id": vector_id(document_id, version, i),
-                "values": values,
-                "metadata": clean,
-            }
-        )
+def _chunk_metadata(
+    document_id: str,
+    version: int,
+    chunk_index: int,
+    chunk: Document,
+    ingested_at: str,
+) -> dict:
+    meta = {
+        "document_id": document_id,
+        "source_file": chunk.metadata.get("source_file", document_id),
+        "version": version,
+        "chunk_index": chunk_index,
+        "embedding_model": EMBEDDING_MODEL,
+        "file_format": chunk.metadata.get("file_format", ""),
+        "document_type": chunk.metadata.get("document_type", ""),
+        "ingested_at": ingested_at,
+    }
+    for k in ("page_number", "row_index", "row_id"):
+        if k in chunk.metadata and chunk.metadata[k] is not None:
+            meta[k] = chunk.metadata[k]
+    return {
+        k: (v if isinstance(v, (str, int, float, bool)) else str(v))
+        for k, v in meta.items()
+    }
 
+
+def upsert_vectors_payload(
+    index,
+    vectors_payload: list[dict],
+    batch_size: int = 50,
+    max_retries: int = 3,
+    cleanup_label: str = "batch",
+) -> int:
+    """Upsert prepared vectors in batches; on failure delete any IDs already written."""
     upserted = 0
     committed_ids: list[str] = []
     try:
@@ -435,9 +460,41 @@ def upsert_chunks(
             try:
                 delete_vectors_by_ids(index, committed_ids)
             except Exception:
-                logger.exception("cleanup failed after partial upsert for %s v%s", document_id, version)
+                logger.exception("cleanup failed after partial upsert (%s)", cleanup_label)
         raise
     return upserted
+
+
+def upsert_chunks(
+    index,
+    embeddings,
+    document_id,
+    version,
+    chunks,
+    batch_size=50,
+    max_retries=3,
+) -> int:
+    texts = [c.page_content for c in chunks]
+    embedded: list[list[float]] = []
+    for i in range(0, len(texts), batch_size):
+        embedded.extend(embeddings.embed_documents(texts[i : i + batch_size]))
+    ingested_at = datetime.now(timezone.utc).isoformat()
+    vectors_payload = []
+    for i, (chunk, values) in enumerate(zip(chunks, embedded)):
+        vectors_payload.append(
+            {
+                "id": vector_id(document_id, version, i),
+                "values": values,
+                "metadata": _chunk_metadata(document_id, version, i, chunk, ingested_at),
+            }
+        )
+    return upsert_vectors_payload(
+        index,
+        vectors_payload,
+        batch_size=batch_size,
+        max_retries=max_retries,
+        cleanup_label=f"{document_id} v{version}",
+    )
 
 
 def delete_vectors_by_ids(index, ids: list[str], batch_size: int = 100) -> None:
@@ -558,6 +615,254 @@ def process_document(
         return "failed"
 
 
+def plan_row_work_items(conn, rows: list[dict]) -> tuple[int, list[RowWorkItem]]:
+    """Classify rows into skip vs work. Returns (skipped_count, items_to_process)."""
+    doc_ids = [row_document_id(TABLE_NAME, row["id"]) for row in rows]
+    states = fetch_document_states(conn, doc_ids)
+    skipped = 0
+    items: list[RowWorkItem] = []
+    for row in rows:
+        doc_id = row_document_id(TABLE_NAME, row["id"])
+        content_hash = sha256_text(canonical_row_payload(row))
+        state = states.get(doc_id)
+        if state and state["content_hash"] == content_hash and state["status"] == "success":
+            skipped += 1
+            continue
+        old_version = state["version"] if state else None
+        old_chunk_count = state["chunk_count"] if state else 0
+        items.append(
+            RowWorkItem(
+                document_id=doc_id,
+                content_hash=content_hash,
+                chunks=[row_as_document(row)],
+                state=state,
+                old_version=old_version,
+                old_chunk_count=old_chunk_count or 0,
+                new_version=(old_version or 0) + 1,
+            )
+        )
+    return skipped, items
+
+
+def _mark_row_items_failed(
+    conn,
+    index,
+    items: list[RowWorkItem],
+    *,
+    scrub_new_version: bool,
+    last_error: str,
+) -> None:
+    for item in items:
+        if scrub_new_version and item.chunks:
+            try:
+                delete_vectors_by_ids(
+                    index,
+                    previous_vector_ids(
+                        item.document_id, item.new_version, len(item.chunks)
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "cleanup new-version vectors after batch failure for %s v%s",
+                    item.document_id,
+                    item.new_version,
+                )
+        ch, ver, cc, em = failure_state_values(
+            item.state, new_content_hash=item.content_hash
+        )
+        upsert_document_state(
+            conn,
+            document_id=item.document_id,
+            content_hash=ch,
+            version=ver,
+            chunk_count=cc,
+            status="failed",
+            embedding_model=em,
+            source_type="table_row",
+            last_error=last_error[:1000],
+        )
+
+
+def process_row_batch(
+    *,
+    conn,
+    index,
+    embeddings,
+    items: list[RowWorkItem],
+    batch_size: int = DEFAULT_ROW_BATCH_SIZE,
+    max_retries: int = 3,
+) -> list[str]:
+    """
+    Embed + upsert a batch of changed rows together.
+    Returns a status per item in the same order: 'success' | 'failed'.
+    """
+    if not items:
+        return []
+
+    statuses: dict[str, str] = {}
+    active: list[RowWorkItem] = []
+    for item in items:
+        if not item.chunks:
+            _mark_row_items_failed(
+                conn,
+                index,
+                [item],
+                scrub_new_version=False,
+                last_error="no chunks produced",
+            )
+            statuses[item.document_id] = "failed"
+        else:
+            active.append(item)
+
+    if not active:
+        return [statuses[item.document_id] for item in items]
+
+    texts: list[str] = []
+    owners: list[tuple[RowWorkItem, int]] = []
+    for item in active:
+        for i, chunk in enumerate(item.chunks):
+            texts.append(chunk.page_content)
+            owners.append((item, i))
+
+    try:
+        embedded: list[list[float]] = []
+        for i in range(0, len(texts), batch_size):
+            embedded.extend(embeddings.embed_documents(texts[i : i + batch_size]))
+        if len(embedded) != len(texts):
+            raise RuntimeError(
+                f"embedded {len(embedded)} vectors != texts {len(texts)}"
+            )
+
+        ingested_at = datetime.now(timezone.utc).isoformat()
+        vectors_payload: list[dict] = []
+        for (item, chunk_index), values in zip(owners, embedded):
+            chunk = item.chunks[chunk_index]
+            vectors_payload.append(
+                {
+                    "id": vector_id(item.document_id, item.new_version, chunk_index),
+                    "values": values,
+                    "metadata": _chunk_metadata(
+                        item.document_id,
+                        item.new_version,
+                        chunk_index,
+                        chunk,
+                        ingested_at,
+                    ),
+                }
+            )
+
+        upserted = upsert_vectors_payload(
+            index,
+            vectors_payload,
+            batch_size=batch_size,
+            max_retries=max_retries,
+            cleanup_label=f"row-batch:{len(active)}",
+        )
+        if upserted != len(vectors_payload):
+            raise RuntimeError(
+                f"upserted {upserted} != vectors {len(vectors_payload)}"
+            )
+    except Exception as exc:
+        logger.exception("row batch embed/upsert failed (%d rows)", len(active))
+        _mark_row_items_failed(
+            conn,
+            index,
+            active,
+            scrub_new_version=True,
+            last_error=str(exc),
+        )
+        for item in active:
+            statuses[item.document_id] = "failed"
+        return [statuses[item.document_id] for item in items]
+
+    for item in active:
+        try:
+            if item.old_version is not None and item.old_chunk_count:
+                delete_vectors_by_ids(
+                    index,
+                    previous_vector_ids(
+                        item.document_id, item.old_version, item.old_chunk_count
+                    ),
+                )
+            upsert_document_state(
+                conn,
+                document_id=item.document_id,
+                content_hash=item.content_hash,
+                version=item.new_version,
+                chunk_count=len(item.chunks),
+                status="success",
+                embedding_model=EMBEDDING_MODEL,
+                source_type="table_row",
+                last_error=None,
+            )
+            statuses[item.document_id] = "success"
+        except Exception as exc:
+            logger.exception("post-upsert finalize failed for %s", item.document_id)
+            _mark_row_items_failed(
+                conn,
+                index,
+                [item],
+                scrub_new_version=True,
+                last_error=str(exc),
+            )
+            statuses[item.document_id] = "failed"
+
+    return [statuses[item.document_id] for item in items]
+
+
+def process_changed_rows(
+    *,
+    conn,
+    index,
+    embeddings,
+    rows: list[dict],
+    row_batch_size: int = DEFAULT_ROW_BATCH_SIZE,
+) -> tuple[int, int, int]:
+    """
+    Plan and process rows in batches.
+    Returns (skipped, success, failed).
+    """
+    skipped, items = plan_row_work_items(conn, rows)
+    success = 0
+    failed = 0
+    if skipped:
+        logger.info("rows skipped (unchanged): %d", skipped)
+    for i in range(0, len(items), row_batch_size):
+        batch = items[i : i + row_batch_size]
+        logger.info(
+            "processing row batch %d-%d of %d changed",
+            i + 1,
+            i + len(batch),
+            len(items),
+        )
+        try:
+            statuses = process_row_batch(
+                conn=conn,
+                index=index,
+                embeddings=embeddings,
+                items=batch,
+                batch_size=row_batch_size,
+            )
+            for item, status in zip(batch, statuses):
+                logger.info("row %s -> %s", item.document_id, status)
+                if status == "success":
+                    success += 1
+                else:
+                    failed += 1
+        except Exception as exc:
+            failed += len(batch)
+            logger.exception("outer failure row batch: %s", exc)
+            for item in batch:
+                upsert_outer_failure_state(
+                    conn,
+                    item.document_id,
+                    source_type="table_row",
+                    last_error=str(exc),
+                    new_content_hash=item.content_hash,
+                )
+    return skipped, success, failed
+
+
 def should_process_files(
     policy_dir: str | Path,
     discovered_ids: set[str],
@@ -587,7 +892,13 @@ def reconcile_deletions(conn, index, current_ids: set[str], source_type: str) ->
     return deleted
 
 
-def run_ingestion(files_only=False, rows_only=False, limit_rows=None, policy_dir=None) -> int:
+def run_ingestion(
+    files_only=False,
+    rows_only=False,
+    limit_rows=None,
+    policy_dir=None,
+    row_batch_size: int = DEFAULT_ROW_BATCH_SIZE,
+) -> int:
     """Run ingestion. Returns 0 on full success, 1 if any failure or skipped file pass."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = load_config()
@@ -598,6 +909,8 @@ def run_ingestion(files_only=False, rows_only=False, limit_rows=None, policy_dir
     dim = embedding_dimension(embeddings)
     pc = Pinecone(api_key=cfg["pinecone_api_key"])
     index = ensure_pinecone_index(pc, cfg["index_name"], dim)
+    if row_batch_size < 1:
+        raise ValueError("row_batch_size must be >= 1")
 
     failures = 0
 
@@ -659,35 +972,18 @@ def run_ingestion(files_only=False, rows_only=False, limit_rows=None, policy_dir
         current_row_ids = {row_document_id(TABLE_NAME, r["id"]) for r in rows}
         if limit_rows is None:
             reconcile_deletions(conn, index, current_row_ids, "table_row")
-        for row in rows:
-            doc_id = row_document_id(TABLE_NAME, row["id"])
-            content_hash = ""
-            try:
-                payload = canonical_row_payload(row)
-                content_hash = sha256_text(payload)
-                chunks = [row_as_document(row)]
-                status = process_document(
-                    conn=conn,
-                    index=index,
-                    embeddings=embeddings,
-                    document_id=doc_id,
-                    content_hash=content_hash,
-                    source_type="table_row",
-                    chunks=chunks,
-                )
-                logger.info("row %s -> %s", doc_id, status)
-                if status == "failed":
-                    failures += 1
-            except Exception as exc:
-                failures += 1
-                logger.exception("outer failure row %s: %s", doc_id, exc)
-                upsert_outer_failure_state(
-                    conn,
-                    doc_id,
-                    source_type="table_row",
-                    last_error=str(exc),
-                    new_content_hash=content_hash,
-                )
+        try:
+            _skipped, _ok, row_failed = process_changed_rows(
+                conn=conn,
+                index=index,
+                embeddings=embeddings,
+                rows=rows,
+                row_batch_size=row_batch_size,
+            )
+            failures += row_failed
+        except Exception as exc:
+            failures += 1
+            logger.exception("outer failure processing rows: %s", exc)
 
     conn.close()
     return 1 if failures else 0
@@ -698,6 +994,12 @@ def main():
     parser.add_argument("--files-only", action="store_true")
     parser.add_argument("--rows-only", action="store_true")
     parser.add_argument("--limit-rows", type=int, default=None)
+    parser.add_argument(
+        "--row-batch-size",
+        type=int,
+        default=DEFAULT_ROW_BATCH_SIZE,
+        help=f"Rows to embed/upsert together (default {DEFAULT_ROW_BATCH_SIZE})",
+    )
     parser.add_argument("--policy-dir", default=None)
     args = parser.parse_args()
     sys.exit(
@@ -706,6 +1008,7 @@ def main():
             rows_only=args.rows_only,
             limit_rows=args.limit_rows,
             policy_dir=args.policy_dir,
+            row_batch_size=args.row_batch_size,
         )
     )
 
