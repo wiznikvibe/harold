@@ -10,6 +10,7 @@ from typing import Any
 
 import pymysql
 from dotenv import load_dotenv
+from pinecone import Pinecone, ServerlessSpec
 
 
 EMBEDDING_MODEL = "google/embeddinggemma-300m"
@@ -185,3 +186,49 @@ def list_document_ids(conn, source_type: str | None = None) -> list[str]:
         else:
             cur.execute(f"SELECT document_id FROM {STATE_TABLE}")
         return [r["document_id"] for r in cur.fetchall()]
+
+
+def _ensure_hf_hub_token() -> None:
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_API_KEY")
+    if not token:
+        return
+    os.environ.setdefault("HF_TOKEN", token)
+    os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", token)
+
+
+def build_embeddings(model_name: str = EMBEDDING_MODEL):
+    _ensure_hf_hub_token()
+    from langchain_huggingface import HuggingFaceEmbeddings
+
+    return HuggingFaceEmbeddings(
+        model_name=model_name,
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
+
+
+def embedding_dimension(embeddings) -> int:
+    vec = embeddings.embed_query("dimension probe")
+    return len(vec)
+
+
+def ensure_pinecone_index(
+    pc: Pinecone, index_name: str, dimension: int, metric: str = "cosine"
+):
+    existing = {idx.name for idx in pc.list_indexes()}
+    if index_name not in existing:
+        pc.create_index(
+            name=index_name,
+            dimension=dimension,
+            metric=metric,
+            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+        )
+    else:
+        desc = pc.describe_index(index_name)
+        existing_dim = desc.dimension
+        if existing_dim != dimension:
+            raise RuntimeError(
+                f"Pinecone index '{index_name}' dimension {existing_dim} "
+                f"!= embedding dimension {dimension}. Refusing to delete/recreate."
+            )
+    return pc.Index(index_name)
