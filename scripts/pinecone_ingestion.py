@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import hashlib
 import json
 import logging
@@ -414,18 +415,28 @@ def upsert_chunks(
         )
 
     upserted = 0
-    for i in range(0, len(vectors_payload), batch_size):
-        batch = vectors_payload[i : i + batch_size]
-        for attempt in range(1, max_retries + 1):
+    committed_ids: list[str] = []
+    try:
+        for i in range(0, len(vectors_payload), batch_size):
+            batch = vectors_payload[i : i + batch_size]
+            for attempt in range(1, max_retries + 1):
+                try:
+                    index.upsert(vectors=batch)
+                    upserted += len(batch)
+                    committed_ids.extend(v["id"] for v in batch)
+                    break
+                except Exception as exc:
+                    if attempt == max_retries:
+                        raise
+                    logger.warning("upsert retry %s/%s: %s", attempt, max_retries, exc)
+                    time.sleep(2**attempt)
+    except Exception:
+        if committed_ids:
             try:
-                index.upsert(vectors=batch)
-                upserted += len(batch)
-                break
-            except Exception as exc:
-                if attempt == max_retries:
-                    raise
-                logger.warning("upsert retry %s/%s: %s", attempt, max_retries, exc)
-                time.sleep(2**attempt)
+                delete_vectors_by_ids(index, committed_ids)
+            except Exception:
+                logger.exception("cleanup failed after partial upsert for %s v%s", document_id, version)
+        raise
     return upserted
 
 
@@ -520,6 +531,18 @@ def process_document(
         return "success"
     except Exception as exc:
         logger.exception("failed processing %s", document_id)
+        if chunks:
+            try:
+                delete_vectors_by_ids(
+                    index,
+                    previous_vector_ids(document_id, new_version, len(chunks)),
+                )
+            except Exception:
+                logger.exception(
+                    "cleanup new-version vectors after failure for %s v%s",
+                    document_id,
+                    new_version,
+                )
         ch, ver, cc, em = failure_state_values(state, new_content_hash=content_hash)
         upsert_document_state(
             conn,
@@ -564,7 +587,8 @@ def reconcile_deletions(conn, index, current_ids: set[str], source_type: str) ->
     return deleted
 
 
-def run_ingestion(files_only=False, rows_only=False, limit_rows=None, policy_dir=None):
+def run_ingestion(files_only=False, rows_only=False, limit_rows=None, policy_dir=None) -> int:
+    """Run ingestion. Returns 0 on full success, 1 if any failure or skipped file pass."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = load_config()
     policy_dir = policy_dir or cfg["policy_dir"]
@@ -575,6 +599,8 @@ def run_ingestion(files_only=False, rows_only=False, limit_rows=None, policy_dir
     pc = Pinecone(api_key=cfg["pinecone_api_key"])
     index = ensure_pinecone_index(pc, cfg["index_name"], dim)
 
+    failures = 0
+
     if not rows_only:
         tracked_file_ids = set(list_document_ids(conn, source_type="file"))
         policy_path = Path(policy_dir)
@@ -584,6 +610,7 @@ def run_ingestion(files_only=False, rows_only=False, limit_rows=None, policy_dir
             policy_dir, discovered_ids, tracked_file_ids
         )
         if not should_process:
+            failures += 1
             if skip_reason == "policy_dir_not_directory":
                 logger.error(
                     "policy_dir missing or not a directory: %s; skipping file ingestion",
@@ -614,7 +641,10 @@ def run_ingestion(files_only=False, rows_only=False, limit_rows=None, policy_dir
                         chunks=chunks,
                     )
                     logger.info("file %s -> %s", path.name, status)
+                    if status == "failed":
+                        failures += 1
                 except Exception as exc:
+                    failures += 1
                     logger.exception("outer failure file %s: %s", path.name, exc)
                     upsert_outer_failure_state(
                         conn,
@@ -646,7 +676,10 @@ def run_ingestion(files_only=False, rows_only=False, limit_rows=None, policy_dir
                     chunks=chunks,
                 )
                 logger.info("row %s -> %s", doc_id, status)
+                if status == "failed":
+                    failures += 1
             except Exception as exc:
+                failures += 1
                 logger.exception("outer failure row %s: %s", doc_id, exc)
                 upsert_outer_failure_state(
                     conn,
@@ -657,6 +690,7 @@ def run_ingestion(files_only=False, rows_only=False, limit_rows=None, policy_dir
                 )
 
     conn.close()
+    return 1 if failures else 0
 
 
 def main():
@@ -666,11 +700,13 @@ def main():
     parser.add_argument("--limit-rows", type=int, default=None)
     parser.add_argument("--policy-dir", default=None)
     args = parser.parse_args()
-    run_ingestion(
-        files_only=args.files_only,
-        rows_only=args.rows_only,
-        limit_rows=args.limit_rows,
-        policy_dir=args.policy_dir,
+    sys.exit(
+        run_ingestion(
+            files_only=args.files_only,
+            rows_only=args.rows_only,
+            limit_rows=args.limit_rows,
+            policy_dir=args.policy_dir,
+        )
     )
 
 

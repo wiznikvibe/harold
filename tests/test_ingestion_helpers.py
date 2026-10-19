@@ -64,6 +64,34 @@ class FakeIndex:
         self.deletes.extend(ids)
 
 
+class OrderTrackingIndex(FakeIndex):
+    def __init__(self):
+        super().__init__()
+        self.ops: list[tuple[str, list[str]]] = []
+
+    def upsert(self, vectors):
+        ids = [v["id"] for v in vectors]
+        self.ops.append(("upsert", ids))
+        return super().upsert(vectors)
+
+    def delete(self, ids):
+        self.ops.append(("delete", list(ids)))
+        return super().delete(ids)
+
+
+class FailOnNthUpsertIndex(FakeIndex):
+    def __init__(self, fail_on_call: int):
+        super().__init__()
+        self._call = 0
+        self._fail_on = fail_on_call
+
+    def upsert(self, vectors):
+        self._call += 1
+        if self._call >= self._fail_on:
+            raise RuntimeError("upsert failed")
+        return super().upsert(vectors)
+
+
 class FakeEmb:
     def embed_documents(self, texts):
         return [[0.1] * 8 for _ in texts]
@@ -251,6 +279,141 @@ def test_run_ingestion_skips_reconcile_when_policy_dir_missing(tmp_path):
         }
         fake_conn = FakeConn()
         get_conn.return_value = fake_conn
-        ing.run_ingestion(files_only=True, policy_dir=str(tmp_path / "missing"))
+        code = ing.run_ingestion(files_only=True, policy_dir=str(tmp_path / "missing"))
         reconcile.assert_not_called()
         discover.assert_not_called()
+        assert code == 1
+
+
+def _prior_state(*, version=1, chunk_count=2):
+    return {
+        "content_hash": "prior-hash",
+        "version": version,
+        "chunk_count": chunk_count,
+        "status": "success",
+        "embedding_model": ing.EMBEDDING_MODEL,
+    }
+
+
+def test_process_document_happy_path_upserts_before_old_delete():
+    idx = OrderTrackingIndex()
+    conn = FakeConn(fetchone_result=_prior_state())
+    state_writes = []
+
+    def capture_state(_conn, **kwargs):
+        state_writes.append(kwargs)
+
+    chunks = [ing.Document("a", {}), ing.Document("b", {})]
+    with patch.object(ing, "upsert_document_state", side_effect=capture_state):
+        status = ing.process_document(
+            conn=conn,
+            index=idx,
+            embeddings=FakeEmb(),
+            document_id="SOP.md",
+            content_hash="new-hash",
+            source_type="file",
+            chunks=chunks,
+        )
+    assert status == "success"
+    upsert_ops = [op for op in idx.ops if op[0] == "upsert"]
+    delete_ops = [op for op in idx.ops if op[0] == "delete"]
+    assert upsert_ops
+    assert delete_ops
+    assert idx.ops.index(upsert_ops[0]) < idx.ops.index(delete_ops[0])
+    assert delete_ops[0][1] == ing.previous_vector_ids("SOP.md", 1, 2)
+    assert state_writes[-1]["status"] == "success"
+    assert state_writes[-1]["version"] == 2
+
+
+def test_process_document_upsert_failure_does_not_delete_old_version():
+    idx = FailOnNthUpsertIndex(fail_on_call=1)
+    conn = FakeConn(fetchone_result=_prior_state())
+    chunks = [ing.Document("a", {}), ing.Document("b", {})]
+    status = ing.process_document(
+        conn=conn,
+        index=idx,
+        embeddings=FakeEmb(),
+        document_id="SOP.md",
+        content_hash="new-hash",
+        source_type="file",
+        chunks=chunks,
+    )
+    assert status == "failed"
+    old_ids = set(ing.previous_vector_ids("SOP.md", 1, 2))
+    assert not (old_ids & set(idx.deletes))
+    assert set(idx.deletes) == set(ing.previous_vector_ids("SOP.md", 2, 2))
+
+
+def test_process_document_count_mismatch_no_success_no_old_delete():
+    idx = FakeIndex()
+    conn = FakeConn(fetchone_result=_prior_state())
+    state_writes = []
+    chunks = [ing.Document("a", {}), ing.Document("b", {})]
+
+    def short_upsert(*_args, **_kwargs):
+        return 1
+
+    def record_state(_conn, **kw):
+        state_writes.append(kw)
+
+    with patch.object(ing, "upsert_chunks", side_effect=short_upsert), patch.object(
+        ing, "upsert_document_state", side_effect=record_state
+    ):
+        status = ing.process_document(
+            conn=conn,
+            index=idx,
+            embeddings=FakeEmb(),
+            document_id="SOP.md",
+            content_hash="new-hash",
+            source_type="file",
+            chunks=chunks,
+        )
+    assert status == "failed"
+    old_ids = set(ing.previous_vector_ids("SOP.md", 1, 2))
+    assert not (old_ids & set(idx.deletes))
+    assert state_writes[-1]["status"] == "failed"
+    assert state_writes[-1]["version"] == 1
+
+
+def test_upsert_chunks_cleans_partial_batches_on_failure():
+    idx = FailOnNthUpsertIndex(fail_on_call=2)
+    chunks = [ing.Document("a", {}), ing.Document("b", {})]
+    with patch.object(ing, "time") as mock_time:
+        mock_time.sleep = lambda _s: None
+        try:
+            ing.upsert_chunks(idx, FakeEmb(), "SOP.md", 2, chunks, batch_size=1, max_retries=1)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("expected upsert to fail")
+    assert idx.deletes == ["SOP.md-v2-c0"]
+
+
+def test_run_ingestion_limit_rows_skips_table_reconcile():
+    with patch.object(ing, "load_config") as load_cfg, patch.object(
+        ing, "get_mysql_connection"
+    ) as get_conn, patch.object(ing, "init_state_schema"), patch.object(
+        ing, "build_embeddings"
+    ), patch.object(
+        ing, "embedding_dimension", return_value=8
+    ), patch.object(
+        ing, "Pinecone"
+    ), patch.object(
+        ing, "ensure_pinecone_index", return_value=FakeIndex()
+    ), patch.object(
+        ing, "fetch_table_rows", return_value=[{"id": 1}]
+    ), patch.object(
+        ing, "process_document", return_value="skipped"
+    ), patch.object(
+        ing, "reconcile_deletions"
+    ) as reconcile:
+        load_cfg.return_value = {
+            "policy_dir": "/tmp/unused",
+            "embedding_model": ing.EMBEDDING_MODEL,
+            "pinecone_api_key": "k",
+            "index_name": "idx",
+        }
+        get_conn.return_value = FakeConn()
+        code = ing.run_ingestion(rows_only=True, limit_rows=5)
+        reconcile.assert_not_called()
+        assert code == 0
