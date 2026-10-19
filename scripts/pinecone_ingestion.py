@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import logging
@@ -433,3 +434,177 @@ def delete_vectors_by_ids(index, ids: list[str], batch_size: int = 100) -> None:
         batch = ids[i : i + batch_size]
         if batch:
             index.delete(ids=batch)
+
+
+def process_document(
+    *,
+    conn,
+    index,
+    embeddings,
+    document_id: str,
+    content_hash: str,
+    source_type: str,
+    chunks: list[Document],
+) -> str:
+    """Returns 'skipped' | 'success' | 'failed'."""
+    state = fetch_document_state(conn, document_id)
+    if state and state["content_hash"] == content_hash and state["status"] == "success":
+        return "skipped"
+
+    old_version = state["version"] if state else None
+    old_chunk_count = state["chunk_count"] if state else 0
+    new_version = (old_version or 0) + 1
+
+    try:
+        if not chunks:
+            raise ValueError("no chunks produced")
+        upserted = upsert_chunks(index, embeddings, document_id, new_version, chunks)
+        if upserted != len(chunks):
+            raise RuntimeError(f"upserted {upserted} != chunks {len(chunks)}")
+        if old_version is not None and old_chunk_count:
+            delete_vectors_by_ids(
+                index, previous_vector_ids(document_id, old_version, old_chunk_count)
+            )
+        upsert_document_state(
+            conn,
+            document_id=document_id,
+            content_hash=content_hash,
+            version=new_version,
+            chunk_count=len(chunks),
+            status="success",
+            embedding_model=EMBEDDING_MODEL,
+            source_type=source_type,
+            last_error=None,
+        )
+        return "success"
+    except Exception as exc:
+        logger.exception("failed processing %s", document_id)
+        upsert_document_state(
+            conn,
+            document_id=document_id,
+            content_hash=state["content_hash"] if state else content_hash,
+            version=state["version"] if state else 0,
+            chunk_count=state["chunk_count"] if state else 0,
+            status="failed",
+            embedding_model=state["embedding_model"] if state else EMBEDDING_MODEL,
+            source_type=source_type,
+            last_error=str(exc)[:1000],
+        )
+        return "failed"
+
+
+def reconcile_deletions(conn, index, current_ids: set[str], source_type: str) -> int:
+    deleted = 0
+    for doc_id in list_document_ids(conn, source_type=source_type):
+        if doc_id in current_ids:
+            continue
+        state = fetch_document_state(conn, doc_id)
+        if state and state.get("chunk_count"):
+            delete_vectors_by_ids(
+                index,
+                previous_vector_ids(doc_id, state["version"], state["chunk_count"]),
+            )
+        delete_document_state(conn, doc_id)
+        deleted += 1
+    return deleted
+
+
+def run_ingestion(files_only=False, rows_only=False, limit_rows=None, policy_dir=None):
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    cfg = load_config()
+    policy_dir = policy_dir or cfg["policy_dir"]
+    conn = get_mysql_connection(cfg)
+    init_state_schema(conn)
+    embeddings = build_embeddings(cfg["embedding_model"])
+    dim = embedding_dimension(embeddings)
+    pc = Pinecone(api_key=cfg["pinecone_api_key"])
+    index = ensure_pinecone_index(pc, cfg["index_name"], dim)
+
+    if not rows_only:
+        files = discover_policy_files(policy_dir)
+        current_file_ids = {p.name for p in files}
+        reconcile_deletions(conn, index, current_file_ids, "file")
+        for path in files:
+            try:
+                raw = path.read_bytes()
+                content_hash = sha256_bytes(raw)
+                chunks = chunk_documents(parse_file(path))
+                status = process_document(
+                    conn=conn,
+                    index=index,
+                    embeddings=embeddings,
+                    document_id=path.name,
+                    content_hash=content_hash,
+                    source_type="file",
+                    chunks=chunks,
+                )
+                logger.info("file %s -> %s", path.name, status)
+            except Exception as exc:
+                logger.exception("outer failure file %s: %s", path.name, exc)
+                upsert_document_state(
+                    conn,
+                    document_id=path.name,
+                    content_hash="",
+                    version=0,
+                    chunk_count=0,
+                    status="failed",
+                    embedding_model=EMBEDDING_MODEL,
+                    source_type="file",
+                    last_error=str(exc)[:1000],
+                )
+
+    if not files_only:
+        rows = fetch_table_rows(conn, limit=limit_rows)
+        current_row_ids = {row_document_id(TABLE_NAME, r["id"]) for r in rows}
+        if limit_rows is None:
+            reconcile_deletions(conn, index, current_row_ids, "table_row")
+        for row in rows:
+            doc_id = row_document_id(TABLE_NAME, row["id"])
+            try:
+                payload = canonical_row_payload(row)
+                content_hash = sha256_text(payload)
+                chunks = [row_as_document(row)]
+                status = process_document(
+                    conn=conn,
+                    index=index,
+                    embeddings=embeddings,
+                    document_id=doc_id,
+                    content_hash=content_hash,
+                    source_type="table_row",
+                    chunks=chunks,
+                )
+                logger.info("row %s -> %s", doc_id, status)
+            except Exception as exc:
+                logger.exception("outer failure row %s: %s", doc_id, exc)
+                upsert_document_state(
+                    conn,
+                    document_id=doc_id,
+                    content_hash="",
+                    version=0,
+                    chunk_count=0,
+                    status="failed",
+                    embedding_model=EMBEDDING_MODEL,
+                    source_type="table_row",
+                    last_error=str(exc)[:1000],
+                )
+
+    conn.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Harold Pinecone incremental ingestion")
+    parser.add_argument("--files-only", action="store_true")
+    parser.add_argument("--rows-only", action="store_true")
+    parser.add_argument("--limit-rows", type=int, default=None)
+    parser.add_argument("--policy-dir", default=None)
+    args = parser.parse_args()
+    run_ingestion(
+        files_only=args.files_only,
+        rows_only=args.rows_only,
+        limit_rows=args.limit_rows,
+        policy_dir=args.policy_dir,
+    )
+
+
+if __name__ == "__main__":
+    main()
